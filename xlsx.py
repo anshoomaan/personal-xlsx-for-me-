@@ -6,14 +6,41 @@ per-cell styling, section titles, and plain-text export.
 
 Run:
     python mesh_table.py
+
+Keyboard shortcuts
+------------------
+  Tab            – begin chord (release within 350 ms to trigger an action):
+      Tab  alone         → insert a section title ribbon ABOVE current row
+      Tab → C            → insert a blank column AFTER current column
+      Tab → R            → insert a blank data row AFTER current row
+  Shift+Tab      – also inserts a blank data row AFTER current row
+  Return         – move focus down to the next data row (same column)
+
+Column tricks
+-------------
+  Shift+Click on any column header  – insert a new column AFTER that column
+  Right-Click  on any column header – same as Shift+Click
+  Click  [+]  button in header      – append a column at the far right
+
+File format
+-----------
+  Files are saved / loaded as JSON (extension .mesh).
+  Save is atomic (temp-file + rename) with an automatic .bak backup.
+  The loader validates and repairs every field so older files always open.
+  The plain-text export ("Export .txt") remains available separately.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import re
+import shutil
+import tempfile
 import tkinter as tk
 import tkinter.font as tkfont
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 from typing import Any
 
@@ -63,6 +90,9 @@ ALIGN_SYMBOLS: tuple[tuple[str, str], ...] = (
     ("≡C", "center"),
     ("≡R", "right"),
 )
+
+# File format version — increment only on breaking schema changes
+SAVE_VERSION: int = 2
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +163,184 @@ def _compute_serials(items: list[RowItem]) -> dict[int, str | None]:
 
 
 # ---------------------------------------------------------------------------
+# Serialisation helpers
+# ---------------------------------------------------------------------------
+
+# Known CellStyle field names and their defaults – used for schema repair
+_CELL_STYLE_DEFAULTS: dict[str, Any] = {
+    "family": DEFAULT_FONT_FAMILY,
+    "size": int(DEFAULT_FONT_SIZE),
+    "bold": False,
+    "italic": False,
+    "fg": DEFAULT_TEXT_COLOR,
+    "bg": DEFAULT_FILL_COLOR,
+    "justify": DEFAULT_ALIGNMENT,
+}
+
+_VALID_HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?$")
+_VALID_JUSTIFY = {"left", "center", "right"}
+
+
+def _repair_cell_style(raw: dict) -> CellStyle:
+    """
+    Build a CellStyle from *raw*, filling in defaults for missing or
+    invalid fields so a corrupt or old-format style never crashes load.
+    """
+    d = dict(_CELL_STYLE_DEFAULTS)  # start from safe defaults
+    if isinstance(raw, dict):
+        if isinstance(raw.get("family"), str) and raw["family"].strip():
+            d["family"] = raw["family"]
+        try:
+            sz = int(raw.get("size", d["size"]))
+            d["size"] = max(6, min(sz, 144))
+        except (TypeError, ValueError):
+            pass
+        d["bold"] = bool(raw.get("bold", False))
+        d["italic"] = bool(raw.get("italic", False))
+        for field_name in ("fg", "bg"):
+            val = raw.get(field_name, d[field_name])
+            if isinstance(val, str) and _VALID_HEX_COLOR.match(val):
+                d[field_name] = val
+        justify = raw.get("justify", d["justify"])
+        if justify in _VALID_JUSTIFY:
+            d["justify"] = justify
+    return CellStyle(**d)
+
+
+def _content_hash(payload: dict) -> str:
+    """SHA-256 of the JSON body (without the 'checksum' key itself)."""
+    body = {k: v for k, v in payload.items() if k != "checksum"}
+    raw = json.dumps(body, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _serialize(
+    items: list[RowItem],
+    cell_styles: dict[tuple[int, int], CellStyle],
+    num_cols: int,
+) -> dict:
+    """Convert the full table state to a plain-Python dict (JSON-safe)."""
+    rows_out: list[dict] = []
+    for item in items:
+        if isinstance(item, TitleRow):
+            rows_out.append(
+                {"type": "title", "text": item.text, "has_header": item.has_header}
+            )
+        elif isinstance(item, HeaderRow):
+            rows_out.append({"type": "header", "values": list(item.values)})
+        elif isinstance(item, DataRow):
+            rows_out.append({"type": "data", "values": list(item.values)})
+
+    styles_out: dict[str, dict] = {}
+    for (r, c), style in cell_styles.items():
+        styles_out[f"{r},{c}"] = asdict(style)
+
+    payload = {
+        "version": SAVE_VERSION,
+        "num_cols": num_cols,
+        "rows": rows_out,
+        "cell_styles": styles_out,
+    }
+    payload["checksum"] = _content_hash(payload)
+    return payload
+
+
+def _deserialize(data: dict) -> tuple[list[RowItem], dict[tuple[int, int], CellStyle], int]:
+    """
+    Reconstruct items, cell_styles, and num_cols from a serialised dict.
+
+    Safety guarantees
+    -----------------
+    - Missing / wrong-type fields are replaced with safe defaults.
+    - Checksum mismatch raises a ValueError with a descriptive message
+      (caller decides whether to warn or abort).
+    - Each CellStyle is run through _repair_cell_style().
+    - Every row's values list is normalised to exactly num_cols entries.
+    - Unknown row types are silently skipped.
+    """
+    # ── Checksum ──────────────────────────────────────────────────────
+    stored = data.get("checksum")
+    if stored is not None:
+        expected = _content_hash(data)
+        if stored != expected:
+            raise ValueError(
+                "Checksum mismatch – the file may be corrupted or hand-edited.\n"
+                "Load anyway? (data will be repaired where possible)"
+            )
+
+    # ── num_cols ──────────────────────────────────────────────────────
+    try:
+        num_cols = max(1, int(data.get("num_cols", DEFAULT_COLUMNS)))
+    except (TypeError, ValueError):
+        num_cols = DEFAULT_COLUMNS
+
+    # ── rows ──────────────────────────────────────────────────────────
+    items: list[RowItem] = []
+    for row in data.get("rows", []):
+        if not isinstance(row, dict):
+            continue
+        rtype = row.get("type")
+        if rtype == "title":
+            text = str(row.get("text", "")) if row.get("text") is not None else ""
+            has_hdr = bool(row.get("has_header", False))
+            items.append(TitleRow(text=text, has_header=has_hdr))
+        elif rtype == "header":
+            raw_vals = row.get("values", [])
+            vals = [str(v) for v in raw_vals] if isinstance(raw_vals, list) else []
+            # Pad / trim to num_cols
+            while len(vals) < num_cols:
+                vals.append(f"Column {len(vals) + 1}")
+            vals = vals[:num_cols]
+            items.append(HeaderRow(values=vals))
+        elif rtype == "data":
+            raw_vals = row.get("values", [])
+            vals = [str(v) for v in raw_vals] if isinstance(raw_vals, list) else []
+            while len(vals) < num_cols:
+                vals.append("")
+            vals = vals[:num_cols]
+            items.append(DataRow(values=vals))
+        # else: unknown row type → skip silently
+
+    # ── cell_styles ───────────────────────────────────────────────────
+    cell_styles: dict[tuple[int, int], CellStyle] = {}
+    for key, sd in data.get("cell_styles", {}).items():
+        try:
+            r_str, c_str = str(key).split(",")
+            r, c = int(r_str), int(c_str)
+            cell_styles[(r, c)] = _repair_cell_style(sd)
+        except (ValueError, AttributeError):
+            continue  # malformed key → skip
+
+    return items, cell_styles, num_cols
+
+
+def _atomic_write(path: str, text: str) -> None:
+    """
+    Write *text* to *path* atomically:
+      1. Write to a sibling temp file.
+      2. If an existing file is present, copy it to <path>.bak first.
+      3. os.replace() the temp file into place (atomic on POSIX & Windows).
+    """
+    dir_name = os.path.dirname(path) or "."
+    # Backup existing file
+    if os.path.exists(path):
+        shutil.copy2(path, path + ".bak")
+    # Write to temp then rename
+    fd, tmp = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+
+# ---------------------------------------------------------------------------
 # Main Application
 # ---------------------------------------------------------------------------
 
@@ -145,6 +353,7 @@ class MeshTable:
       - Maintain the list-of-RowItem data model.
       - Apply per-cell styling (font, colour, alignment).
       - Handle keyboard shortcuts and user mutations (add/remove rows & cols).
+      - Save/load the full table state as JSON (.mesh files).
       - Export the table to a formatted plain-text file.
     """
 
@@ -172,6 +381,10 @@ class MeshTable:
         self.focused_item: int | None = None
         self.focused_col: int = 0
         self.cell_widgets: dict[tuple[int, int], tk.Entry] = {}
+
+        # Tab-chord state: Tab alone = title, Tab→C = col after, Tab→R = row after
+        self._chord_pending: bool = False
+        self._chord_after_id: str | None = None   # tk after() handle
 
         # Preview labels updated when colour pickers run
         self._pen_prev: tk.Label
@@ -323,7 +536,8 @@ class MeshTable:
         ).pack(side=tk.LEFT)
 
         for label, command, bg in (
-            ("SAVE AS .TXT", self._save, "#222"),
+            ("EXPORT .TXT", self._export_txt, "#222"),
+            ("SAVE  (.mesh)", self._save, "#1a472a"),
             ("OPEN FILE", self._open, "#3a3a3a"),
         ):
             tk.Button(
@@ -413,7 +627,8 @@ class MeshTable:
         self._update_align_btns()
 
         tk.Label(
-            row, text="  Tab = insert section title",
+            row,
+            text="  Tab→C = col after  |  Tab→R = row after  |  Tab alone = section title  |  Shift+Tab = row after",
             bg=TOOLBAR_BG, fg="#555", font=("Segoe UI", 8, "italic"),
         ).pack(side=tk.RIGHT, padx=6)
 
@@ -628,7 +843,11 @@ class MeshTable:
         self._render()
 
     def _render_header_row(self, row_idx: int, item: HeaderRow) -> None:
-        """Column heading row with editable names and [+] add-column button."""
+        """
+        Column heading row with editable names and [+] add-column button.
+
+        Shift+Click on any header cell inserts a new column AFTER that column.
+        """
         tk.Label(
             self.inner, text="  #  ",
             bg=HEADER_BG, fg=HEADER_FG,
@@ -651,6 +870,15 @@ class MeshTable:
             entry.bind(
                 "<Return>",
                 lambda _e, i=row_idx, c=col, w=entry: self._save_header_cell(i, c, w),
+            )
+            # Shift+Click → insert a column AFTER this one
+            entry.bind(
+                "<Shift-Button-1>",
+                lambda _e, c=col: self._add_column_after(c),
+            )
+            entry.bind(
+                "<Button-3>",   # right-click also works as an alternative
+                lambda _e, c=col: self._add_column_after(c),
             )
             self.cell_widgets[(row_idx, col)] = entry
 
@@ -705,6 +933,9 @@ class MeshTable:
                 lambda _e, i=row_idx, c=col, w=entry: self._save_data_cell(i, c, w),
             )
             entry.bind("<Tab>", self._on_tab)
+            entry.bind("<Shift-Tab>", self._on_shift_tab)
+            # Cross-platform: Linux sometimes uses ISO_Left_Tab for Shift+Tab
+            entry.bind("<ISO_Left_Tab>", self._on_shift_tab)
             entry.bind("<Return>", self._on_return)
             self.cell_widgets[(row_idx, col)] = entry
 
@@ -724,25 +955,109 @@ class MeshTable:
     # Keyboard event handlers
     # ------------------------------------------------------------------
 
-    def _on_tab(self, _event: tk.Event) -> str:
-        """Tab: insert a new title ribbon above the current row."""
+    # ── Tab chord dispatcher ──────────────────────────────────────────
+    # Press Tab → chord window opens (350 ms).
+    #   • Next key = C  → insert column AFTER focused column
+    #   • Next key = R  → insert row AFTER focused row
+    #   • Timeout / any other key → insert title ribbon ABOVE current row
+
+    def _on_tab(self, event: tk.Event) -> str:
+        """
+        Tab keypress: start the chord window.
+        If Tab arrives while a chord is already pending we treat it as a
+        'plain Tab' so rapid double-Tab still inserts a title.
+        """
+        if self._chord_pending:
+            self._chord_cancel()
+            self._do_insert_title()
+            return "break"
+
         if self.focused_item is None:
             return "break"
 
-        row_idx, col = self.focused_item, self.focused_col
+        # Snapshot focused cell now (focus may move before timer fires)
+        row_idx = self.focused_item
+        col = self.focused_col
         widget = self.cell_widgets.get((row_idx, col))
         if widget:
             self._save_data_cell(row_idx, col, widget)
 
+        self._chord_pending = True
+        self._chord_after_id = self.root.after(350, self._chord_timeout)
+
+        # Bind C and R globally for the duration of the chord window
+        self.root.bind_all("<KeyPress-c>", self._on_chord_c, add=False)
+        self.root.bind_all("<KeyPress-C>", self._on_chord_c, add=False)
+        self.root.bind_all("<KeyPress-r>", self._on_chord_r, add=False)
+        self.root.bind_all("<KeyPress-R>", self._on_chord_r, add=False)
+        return "break"
+
+    def _chord_cancel(self) -> None:
+        """Cancel a pending chord window (timer + bindings)."""
+        if self._chord_after_id is not None:
+            self.root.after_cancel(self._chord_after_id)
+            self._chord_after_id = None
+        self._chord_pending = False
+        for seq in ("<KeyPress-c>", "<KeyPress-C>", "<KeyPress-r>", "<KeyPress-R>"):
+            try:
+                self.root.unbind_all(seq)
+            except tk.TclError:
+                pass
+
+    def _chord_timeout(self) -> None:
+        """350 ms elapsed with no chord key → run the default Tab action."""
+        self._chord_after_id = None
+        if self._chord_pending:
+            self._chord_pending = False
+            for seq in ("<KeyPress-c>", "<KeyPress-C>", "<KeyPress-r>", "<KeyPress-R>"):
+                try:
+                    self.root.unbind_all(seq)
+                except tk.TclError:
+                    pass
+            self._do_insert_title()
+
+    def _on_chord_c(self, _event: tk.Event) -> str:
+        """Tab → C: insert a blank column AFTER the currently focused column."""
+        if not self._chord_pending:
+            return ""
+        self._chord_cancel()
+        if self.focused_item is not None:
+            self._add_column_after(self.focused_col)
+        return "break"
+
+    def _on_chord_r(self, _event: tk.Event) -> str:
+        """Tab → R: insert a blank data row AFTER the currently focused row."""
+        if not self._chord_pending:
+            return ""
+        self._chord_cancel()
+        if self.focused_item is not None:
+            self._insert_row_after(self.focused_item)
+        return "break"
+
+    def _do_insert_title(self) -> None:
+        """Insert a title ribbon ABOVE the currently focused row."""
+        if self.focused_item is None:
+            return
+        row_idx = self.focused_item
         self.items.insert(row_idx, TitleRow())
         self.focused_item = row_idx + 1
         self._render()
-
         title_entry = self.cell_widgets.get((row_idx, -1))
         if title_entry:
             self.root.after(
                 50, lambda w=title_entry: (w.focus_set(), w.selection_range(0, tk.END))
             )
+
+    def _on_shift_tab(self, _event: tk.Event) -> str:
+        """Shift+Tab: insert a blank data row immediately AFTER the current row."""
+        if self.focused_item is None:
+            return "break"
+        row_idx = self.focused_item
+        col = self.focused_col
+        widget = self.cell_widgets.get((row_idx, col))
+        if widget:
+            self._save_data_cell(row_idx, col, widget)
+        self._insert_row_after(row_idx)
         return "break"
 
     def _on_return(self, _event: tk.Event) -> str:
@@ -770,23 +1085,84 @@ class MeshTable:
         self.items.append(DataRow(values=[""] * self.num_cols))
         self._render()
 
-    def _add_row_at(self, index: int) -> None:
-        """Insert a blank data row immediately before *index*."""
+    def _insert_row_after(self, row_idx: int) -> None:
+        """
+        Core helper: insert a blank DataRow at row_idx+1, re-key cell_styles,
+        update focused_item, and re-render.  Called by Shift+Tab, Tab→R, and
+        _add_row_at (which uses the 'before' variant).
+        """
         self._flush_all()
+        insert_at = row_idx + 1
+        # Shift styles: rows strictly after row_idx move down one
+        new_styles: dict[tuple[int, int], CellStyle] = {}
+        for (r, c), style in self.cell_styles.items():
+            new_styles[(r + 1, c) if r > row_idx else (r, c)] = style
+        self.cell_styles = new_styles
+        self.items.insert(insert_at, DataRow(values=[""] * self.num_cols))
+        self.focused_item = insert_at
+        self.focused_col = 0
+        self._render()
+
+    def _add_row_at(self, index: int) -> None:
+        """Insert a blank data row immediately BEFORE *index* (used by separator button)."""
+        self._flush_all()
+        # Rows at or after the insertion point shift down
+        new_styles: dict[tuple[int, int], CellStyle] = {}
+        for (r, c), style in self.cell_styles.items():
+            new_styles[(r + 1, c) if r >= index else (r, c)] = style
+        self.cell_styles = new_styles
         self.items.insert(index, DataRow(values=[""] * self.num_cols))
         self._render()
 
+
     def _add_column(self) -> None:
+        """Append a new column at the far right (the [+] header button)."""
+        self._add_column_after(self.num_cols - 1)
+
+    def _add_column_after(self, after_col: int) -> None:
+        """
+        Insert a new blank column immediately AFTER *after_col*.
+
+        Steps:
+          1. Flush all live widgets to the model.
+          2. In every HeaderRow / DataRow, splice a blank string at
+             position after_col + 1 and trim to the new num_cols.
+          3. Re-key cell_styles so indices beyond the insertion point
+             shift right by 1 (column axis).
+          4. Re-render.
+        """
         self._flush_all()
+        insert_at = after_col + 1
         self.num_cols += 1
-        for item in self.items:
-            if isinstance(item, (HeaderRow, DataRow)):
-                while len(item.values) < self.num_cols:
-                    item.values.append("")
-        # Label the new header column in every HeaderRow
+
         for item in self.items:
             if isinstance(item, HeaderRow):
-                item.values[self.num_cols - 1] = f"Column {self.num_cols}"
+                # Ensure list is long enough before splicing
+                while len(item.values) < self.num_cols - 1:
+                    item.values.append(f"Column {len(item.values) + 1}")
+                item.values.insert(insert_at, f"Column {insert_at + 1}")
+                # Trim to exact num_cols length
+                item.values = item.values[: self.num_cols]
+                # Re-number column labels after the insertion point
+                for i in range(insert_at + 1, self.num_cols):
+                    # Only rename columns that still carry the default name pattern
+                    pass  # user-customised names are preserved as-is
+
+            elif isinstance(item, DataRow):
+                while len(item.values) < self.num_cols - 1:
+                    item.values.append("")
+                item.values.insert(insert_at, "")
+                item.values = item.values[: self.num_cols]
+
+        # Re-key cell styles (column axis: indices >= insert_at shift right)
+        new_styles: dict[tuple[int, int], CellStyle] = {}
+        for (r, c), style in self.cell_styles.items():
+            if c >= insert_at:
+                new_styles[(r, c + 1)] = style
+            else:
+                new_styles[(r, c)] = style
+        self.cell_styles = new_styles
+
         self._render()
 
     def _remove_title(self, row_idx: int) -> None:
@@ -802,13 +1178,133 @@ class MeshTable:
         self._render()
 
     # ------------------------------------------------------------------
-    # File I/O
+    # File I/O  –  Save / Load (.mesh JSON)
     # ------------------------------------------------------------------
 
     def _save(self) -> None:
-        """Export the table to a formatted plain-text (.txt) file."""
+        """
+        Save the full table state as a JSON .mesh file.
+
+        Safety:
+         - Flushes every live widget before serialising.
+         - Embeds a SHA-256 checksum of the payload.
+         - Atomic write: temp-file → os.replace (no half-written files).
+         - Backs up the previous version to <name>.mesh.bak automatically.
+        """
         raw_name = simpledialog.askstring(
             "Save File", "Enter filename (without extension):", parent=self.root
+        )
+        if not raw_name or not raw_name.strip():
+            return
+
+        filename = raw_name.strip()
+        if not filename.lower().endswith(".mesh"):
+            filename += ".mesh"
+        path = os.path.join(SCRIPT_DIR, filename)
+
+        self._flush_all()
+        payload = _serialize(self.items, self.cell_styles, self.num_cols)
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+
+        try:
+            _atomic_write(path, text)
+        except Exception as exc:
+            messagebox.showerror("Save Failed", f"Could not write file:\n{exc}")
+            return
+
+        bak = path + ".bak"
+        bak_note = f"\n(Previous version backed up to {os.path.basename(bak)})" if os.path.exists(bak) else ""
+        messagebox.showinfo("Saved ✓", f"Saved to:\n{path}{bak_note}")
+
+    def _open(self) -> None:
+        """
+        Open a previously saved .mesh file and restore the full table state.
+
+        Safety:
+         - Validates JSON structure before touching live state.
+         - Verifies SHA-256 checksum; on mismatch asks the user whether to
+           proceed with best-effort repair rather than crashing.
+         - Every row value list is padded/trimmed to num_cols.
+         - Every CellStyle is repaired field-by-field with known good defaults.
+         - If the file is completely unparseable the current session is kept.
+        """
+        path = filedialog.askopenfilename(
+            initialdir=SCRIPT_DIR,
+            filetypes=[
+                ("Mesh files", "*.mesh"),
+                ("All files", "*.*"),
+            ],
+            title="Open .mesh File",
+        )
+        if not path:
+            return
+
+        # ── Parse JSON ────────────────────────────────────────────────
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except json.JSONDecodeError as exc:
+            messagebox.showerror(
+                "Open Failed",
+                f"File is not valid JSON:\n{exc}\n\nYour current session is unchanged.",
+            )
+            return
+        except Exception as exc:
+            messagebox.showerror("Open Failed", f"Could not read file:\n{exc}")
+            return
+
+        if not isinstance(data, dict):
+            messagebox.showerror("Open Failed", "File does not contain a valid table object.")
+            return
+
+        # ── Deserialise (checksum-aware) ───────────────────────────────
+        try:
+            items, cell_styles, num_cols = _deserialize(data)
+        except ValueError as exc:
+            # Checksum mismatch – ask user
+            proceed = messagebox.askyesno(
+                "Checksum Warning",
+                str(exc),
+                icon="warning",
+            )
+            if not proceed:
+                return
+            # Retry without checksum enforcement
+            patched = dict(data)
+            patched.pop("checksum", None)
+            try:
+                items, cell_styles, num_cols = _deserialize(patched)
+            except Exception as exc2:
+                messagebox.showerror("Repair Failed", f"Could not repair file:\n{exc2}")
+                return
+        except Exception as exc:
+            messagebox.showerror("Parse Error", f"Unexpected error parsing file:\n{exc}")
+            return
+
+        # ── Apply to live state ────────────────────────────────────────
+        self.items = items
+        self.cell_styles = cell_styles
+        self.num_cols = num_cols
+        self.focused_item = None
+        self.focused_col = 0
+        self._chord_cancel()
+
+        self._render()
+        messagebox.showinfo(
+            "Opened ✓",
+            f"Loaded:\n{path}\n\n"
+            f"{len(items)} rows  ·  {num_cols} columns",
+        )
+
+
+    # ------------------------------------------------------------------
+    # Plain-text export  (unchanged, kept as separate action)
+    # ------------------------------------------------------------------
+
+    def _export_txt(self) -> None:
+        """Export the table to a formatted plain-text (.txt) file."""
+        raw_name = simpledialog.askstring(
+            "Export .txt", "Enter filename (without extension):", parent=self.root
         )
         if not raw_name or not raw_name.strip():
             return
@@ -824,7 +1320,7 @@ class MeshTable:
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines))
 
-        messagebox.showinfo("Saved ✓", f"Saved to:\n{path}")
+        messagebox.showinfo("Exported ✓", f"Exported to:\n{path}")
 
     def _build_export_lines(self) -> list[str]:
         """Return the plain-text export lines for all rows."""
@@ -845,26 +1341,16 @@ class MeshTable:
             elif isinstance(item, DataRow):
                 serial = serial_map.get(idx) or "   "
                 cells = "\t".join(
-                    (item.values[c].ljust(EXPORT_COL_PAD) if c < len(item.values) else " " * EXPORT_COL_PAD)
+                    (
+                        item.values[c].ljust(EXPORT_COL_PAD)
+                        if c < len(item.values)
+                        else " " * EXPORT_COL_PAD
+                    )
                     for c in range(self.num_cols)
                 )
                 lines.append(f"{serial}  {cells}")
 
         return lines
-
-    def _open(self) -> None:
-        """Open a plain-text file (full import parsing is a future enhancement)."""
-        path = filedialog.askopenfilename(
-            initialdir=SCRIPT_DIR,
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
-            title="Open File",
-        )
-        if not path:
-            return
-        messagebox.showinfo(
-            "Open File",
-            f"Selected:\n{path}\n\n(Import parsing coming soon)",
-        )
 
 
 # ---------------------------------------------------------------------------
